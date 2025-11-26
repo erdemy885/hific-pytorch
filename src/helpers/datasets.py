@@ -10,8 +10,13 @@ import PIL
 from tqdm import tqdm
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torchvision import transforms, datasets
+
+try:
+    from datasets import load_dataset
+except ImportError:
+    load_dataset = None
 
 DIR = os.path.abspath(os.path.dirname(__file__))
 COLOUR_BLACK = 0
@@ -20,7 +25,8 @@ NUM_DATASET_WORKERS = 4
 SCALE_MIN = 0.75
 SCALE_MAX = 0.95
 DATASETS_DICT = {"openimages": "OpenImages", "cityscapes": "CityScapes", 
-                 "jetimages": "JetImages", "evaluation": "Evaluation"}
+                 "jetimages": "JetImages", "evaluation": "Evaluation",
+                 "imagenet": "ImageNet"}
 DATASETS = list(DATASETS_DICT.keys())
 
 def get_dataset(dataset):
@@ -50,7 +56,7 @@ def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=T
 
     Parameters
     ----------
-    dataset : {"openimages", "jetimages", "evaluation"}
+    dataset : {"openimages", "jetimages", "evaluation", "imagenet"}
         Name of the dataset to load
 
     root : str
@@ -66,6 +72,9 @@ def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=T
         dataset = Dataset(logger=logger, mode=mode, normalize=normalize, **kwargs)
     else:
         dataset = Dataset(root=root, logger=logger, mode=mode, normalize=normalize, **kwargs)
+
+    if isinstance(dataset, IterableDataset):
+        shuffle = False
 
     return DataLoader(dataset,
                       batch_size=batch_size,
@@ -121,6 +130,65 @@ class BaseDataset(Dataset, abc.ABC):
             Tensor in [0.,1.] of shape `img_size`.
         """
         pass
+
+class ImageNet(IterableDataset):
+    """ImageNet wrapper using Hugging Face datasets with streaming."""
+    img_size = (3, 256, 256)
+    background_color = COLOUR_BLACK
+
+    def __init__(self, root=None, mode='train', logger=logging.getLogger(__name__), normalize=False, **kwargs):
+        if load_dataset is None:
+            raise ImportError("Please install 'datasets' library to use ImageNet.")
+        
+        self.logger = logger
+        self.mode = mode
+        self.normalize = normalize
+        self.dataset_id = "timm/imagenet-1k-wds"
+        self.split = "train" if mode == 'train' else "validation"
+        self.crop_size = 256
+        self.image_dims = (3, self.crop_size, self.crop_size)
+        
+        cache_dir = root if root else None
+        # Initialize dataset
+        self.hf_dataset = load_dataset(self.dataset_id, split=self.split, streaming=True, cache_dir=cache_dir)
+        
+        if mode == 'train':
+            # Shuffle for training
+            self.hf_dataset = self.hf_dataset.shuffle(seed=42, buffer_size=5000)
+
+    def _transforms(self):
+        transforms_list = [
+            transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.LANCZOS),
+            transforms.ToTensor()
+        ]
+        
+        if self.normalize:
+             transforms_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+             
+        return transforms.Compose(transforms_list)
+
+    def __iter__(self):
+        transform = self._transforms()
+        iterator = iter(self.hf_dataset)
+        
+        for example in iterator:
+            try:
+                img = example.get('jpg') or example.get('image')
+                
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Approximate bpp or set to 0 as we stream decoded images
+                bpp = 0.0
+                
+                transformed = transform(img)
+                yield transformed, bpp
+            except Exception:
+                continue
+
+    def __len__(self):
+        # Approximate size for logging
+        return 1281167 if self.split == 'train' else 50000
 
 class Evaluation(BaseDataset):
     """
